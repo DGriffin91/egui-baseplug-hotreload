@@ -5,4 +5,6 @@ Very experimental - WIP.
 
 Compile reload to plugin with `cargo build -p reload --release`
 
-Edit reloaded to trigger rebuild/reload
+Edit reloaded and compile with `cargo build -p reloaded --release`
+
+Click reload in VST UI

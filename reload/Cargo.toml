@@ -16,10 +16,15 @@ egui = "0.13"
 serde = { version = "1.0", features = ["derive"] }
 raw-window-handle = "0.3"
 vst = "0.2"
-hotlib = "0.1.0"
 
 dirs = "3"
 log = "0.4"
 log-panics = "2"
 simplelog = "0.8"
+
+libloading = "0.7"
+
+rand = "0.8.4"
+
+ron = "0.6"
 

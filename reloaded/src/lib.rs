@@ -44,8 +44,8 @@ impl TestTrait for SomeData {
     #[no_mangle]
     fn process(&mut self, l: f32, r: f32, _model: &GainModelProcess) -> (f32, f32) {
         //(l, r)
-        //((l * 10.0).sin() * 0.1, (r * 10.0).sin() * 0.1)
-        ((l * 10.0).tanh() * 0.1, (r * 10.0).tanh() * 0.1)
+        //((l * 10.0).sin() * 0.2, (r * 10.0).sin() * 0.2)
+        ((l * 10.0).tanh() * 0.2, (r * 10.0).tanh() * 0.2)
     }
 }
 

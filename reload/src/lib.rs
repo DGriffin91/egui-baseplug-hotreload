@@ -13,8 +13,10 @@ use egui_baseview::{EguiWindow, Queue, RenderSettings, Settings};
 pub mod lib_loader;
 pub mod logging;
 
-use lib_loader::LibLoader;
+use lib_loader::{rand_vals, vals_to_string, LibLoader, TestTrait};
 use logging::init_logging;
+
+use std::fmt::Write;
 
 baseplug::model! {
     #[derive(Debug, Serialize, Deserialize)]
@@ -33,6 +35,23 @@ baseplug::model! {
         #[parameter(name = "gain master", unit = "Decibels",
             gradient = "Power(0.15)")]
         pub gain_master: f32,
+
+
+        #[model(min = 0.0, max = 1.0)]
+        #[parameter(name = "path_val1", unit = "Generic",
+            gradient = "Linear")]
+        pub path_val1: f32,
+
+        #[model(min = 0.0, max = 1.0)]
+        #[parameter(name = "path_val2", unit = "Generic",
+            gradient = "Linear")]
+        pub path_val2: f32,
+
+
+        #[model(min = 0.0, max = 1.0)]
+        #[parameter(name = "path_val2", unit = "Generic",
+            gradient = "Linear")]
+        pub update_event: f32,
     }
 }
 
@@ -45,12 +64,16 @@ impl Default for GainModel {
             gain_left: 1.0,
             gain_right: 1.0,
             gain_master: 1.0,
+            path_val1: 0.0,
+            path_val2: 0.0,
+            update_event: 0.0,
         }
     }
 }
 
 struct Gain {
-    lib_load: LibLoader,
+    lib_load: Option<LibLoader>,
+    process_trait: Option<Box<dyn TestTrait>>,
 }
 
 impl Plugin for Gain {
@@ -66,29 +89,53 @@ impl Plugin for Gain {
     #[inline]
     fn new(_sample_rate: f32, _model: &GainModel) -> Self {
         init_logging("EGUIBaseviewTest.log");
-        let mut lib_load = LibLoader::new();
-        lib_load.setup_watch();
 
-        Self { lib_load }
+        Self {
+            lib_load: None,
+            process_trait: None,
+        }
     }
 
     #[inline]
     fn process(&mut self, model: &GainModelProcess, ctx: &mut ProcessContext<Self>) {
-        //move to seperate thread
-        if self.lib_load.check_load() {
-            self.lib_load.init_test_trait();
+        let current_vals = (
+            model.path_val1[ctx.nframes - 1],
+            model.path_val2[ctx.nframes - 1],
+        );
+
+        if self.lib_load.is_none() {
+            self.lib_load = LibLoader::new_from_vals(current_vals);
+            if let Some(lib_load) = self.lib_load.as_mut() {
+                lib_load.load_existing();
+                self.process_trait = lib_load.get_process_trait();
+            }
         }
+
+        if let Some(lib_load) = self.lib_load.as_mut() {
+            if lib_load.rnd_path_vals != current_vals
+                || lib_load.update_event != model.update_event[ctx.nframes - 1]
+            {
+                lib_load.update_event = model.update_event[ctx.nframes - 1];
+                self.lib_load = LibLoader::new_from_vals(current_vals);
+                if let Some(lib_load) = self.lib_load.as_mut() {
+                    lib_load.load_existing();
+                    self.process_trait = lib_load.get_process_trait();
+                }
+            }
+        }
+
         let input = &ctx.inputs[0].buffers;
         let output = &mut ctx.outputs[0].buffers;
 
         for i in 0..ctx.nframes {
             let mut l = input[0][i];
             let mut r = input[1][i];
-            if let Some(trait_object) = &mut self.lib_load.trait_object {
-                let audio = trait_object.process(l, r, model);
-                l = audio.0;
-                r = audio.1;
+            if let Some(process_trait) = self.process_trait.as_mut() {
+                let (tl, tr) = process_trait.process(l, r, model);
+                l = tl;
+                r = tr;
             }
+
             output[0][i] = l * model.gain_left[i] * model.gain_master[i];
             output[1][i] = r * model.gain_right[i] * model.gain_master[i];
             //output[0][i] = input[0][i] * model.gain_left[i] * model.gain_master[i];
@@ -147,15 +194,12 @@ impl baseplug::PluginUI for Gain {
             render_settings: RenderSettings::default(),
         };
 
-        let mut lib_load = LibLoader::new();
-        lib_load.setup_watch();
-
         EguiWindow::open_parented(
             parent,
             settings,
             EditorState {
                 state: State::new(model),
-                lib_load,
+                lib_load: LibLoader::new(),
             },
             // Called once before the first frame. Allows you to do setup code and to
             // call `ctx.set_fonts()`. Optional.
@@ -164,11 +208,35 @@ impl baseplug::PluginUI for Gain {
             // application and build the UI.
             |egui_ctx: &CtxRef, _queue: &mut Queue, editor_state: &mut EditorState| {
                 // Must be called on the top of each frame in order to sync values from the rt thread.
-                editor_state.state.model.update();
-                editor_state.lib_load.check_load();
 
                 egui::Window::new("egui-baseplug gain demo").show(&egui_ctx, |ui| {
+                    if ui.button("RELOAD").clicked() {
+                        editor_state.lib_load.load();
+                        let v = editor_state.state.model.update_event.value();
+                        editor_state
+                            .state
+                            .model
+                            .update_event
+                            .set_from_normalized(v + 0.0001);
+                    }
+                    editor_state
+                        .state
+                        .model
+                        .path_val1
+                        .set_from_normalized(editor_state.lib_load.rnd_path_vals.0);
+                    editor_state
+                        .state
+                        .model
+                        .path_val2
+                        .set_from_normalized(editor_state.lib_load.rnd_path_vals.1);
+
                     let state = &mut editor_state.state;
+
+                    ui.label(&editor_state.lib_load.rnd_path_str);
+
+                    ui.label(editor_state.lib_load.rnd_path_vals.0.to_string());
+                    ui.label(editor_state.lib_load.rnd_path_vals.1.to_string());
+
                     // Sync text values if there was automation.
                     update_value_text(&mut state.gain_master_value, &state.model.gain_master);
                     update_value_text(&mut state.gain_left_value, &state.model.gain_left);
