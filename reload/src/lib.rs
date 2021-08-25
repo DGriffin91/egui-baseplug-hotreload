@@ -2,7 +2,7 @@
 #![feature(generic_associated_types)]
 #![feature(min_specialization)]
 
-use baseplug::{Model, Plugin, ProcessContext, UIFloatParam, UIModel, WindowOpenResult};
+use baseplug::{Model, Plugin, PluginContext, ProcessContext, UIFloatParam, WindowOpenResult};
 use baseview::{Size, WindowOpenOptions, WindowScalePolicy};
 use raw_window_handle::HasRawWindowHandle;
 use serde::{Deserialize, Serialize};
@@ -13,10 +13,12 @@ use egui_baseview::{EguiWindow, Queue, RenderSettings, Settings};
 pub mod lib_loader;
 pub mod logging;
 
-use lib_loader::{rand_vals, vals_to_string, LibLoader, TestTrait};
+use lib_loader::{LibLoader, TestTrait};
 use logging::init_logging;
 
-use std::fmt::Write;
+use std::thread;
+
+use keyboard_types::KeyboardEvent;
 
 baseplug::model! {
     #[derive(Debug, Serialize, Deserialize)]
@@ -71,6 +73,17 @@ impl Default for GainModel {
     }
 }
 
+pub struct GainShared {}
+
+unsafe impl Send for GainShared {}
+unsafe impl Sync for GainShared {}
+
+impl PluginContext<Gain> for GainShared {
+    fn new() -> Self {
+        Self {}
+    }
+}
+
 struct Gain {
     lib_load: Option<LibLoader>,
     process_trait: Option<Box<dyn TestTrait>>,
@@ -85,9 +98,10 @@ impl Plugin for Gain {
     const OUTPUT_CHANNELS: usize = 2;
 
     type Model = GainModel;
+    type PluginContext = GainShared;
 
     #[inline]
-    fn new(_sample_rate: f32, _model: &GainModel) -> Self {
+    fn new(_sample_rate: f32, _model: &GainModel, _shared: &GainShared) -> Self {
         init_logging("EGUIBaseviewTest.log");
 
         Self {
@@ -97,7 +111,12 @@ impl Plugin for Gain {
     }
 
     #[inline]
-    fn process(&mut self, model: &GainModelProcess, ctx: &mut ProcessContext<Self>) {
+    fn process(
+        &mut self,
+        model: &GainModelProcess,
+        ctx: &mut ProcessContext<Self>,
+        _shared: &GainShared,
+    ) {
         let current_vals = (
             model.path_val1[ctx.nframes - 1],
             model.path_val2[ctx.nframes - 1],
@@ -121,6 +140,8 @@ impl Plugin for Gain {
                     lib_load.load_existing();
                     self.process_trait = lib_load.get_process_trait();
                 }
+
+                ::log::info!("process RELOAD thread id {:?}", thread::current().id());
             }
         }
 
@@ -183,6 +204,7 @@ impl baseplug::PluginUI for Gain {
 
     fn ui_open(
         parent: &impl HasRawWindowHandle,
+        _ctx: &GainShared,
         model: <Self::Model as Model<Self>>::UI,
     ) -> WindowOpenResult<Self::Handle> {
         let settings = Settings {
@@ -218,6 +240,7 @@ impl baseplug::PluginUI for Gain {
                             .model
                             .update_event
                             .set_from_normalized(v + 0.0001);
+                        ::log::info!("UI RELOAD thread id {:?}", thread::current().id());
                     }
                     editor_state
                         .state
@@ -261,8 +284,25 @@ impl baseplug::PluginUI for Gain {
         Ok(())
     }
 
-    fn ui_close(mut _handle: Self::Handle) {
+    fn ui_close(mut _handle: Self::Handle, _ctx: &GainShared) {
         // TODO: Close window once baseview gets the ability to do this.
+    }
+
+    fn ui_key_down(_ctx: &GainShared, _ev: KeyboardEvent) -> bool {
+        // TODO
+        true
+    }
+
+    fn ui_key_up(_ctx: &GainShared, _ev: KeyboardEvent) -> bool {
+        // TODO
+        true
+    }
+
+    fn ui_param_notify(
+        _handle: &Self::Handle,
+        _param: &'static baseplug::Param<Self, <Self::Model as baseplug::Model<Self>>::Smooth>,
+        _val: f32,
+    ) {
     }
 }
 
