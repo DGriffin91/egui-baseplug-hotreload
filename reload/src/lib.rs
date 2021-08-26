@@ -5,6 +5,7 @@
 use baseplug::{Model, Plugin, PluginContext, ProcessContext, UIFloatParam, WindowOpenResult};
 use baseview::{Size, WindowOpenOptions, WindowScalePolicy};
 use raw_window_handle::HasRawWindowHandle;
+use ringbuf::{Consumer, Producer, RingBuffer};
 use serde::{Deserialize, Serialize};
 
 use egui::CtxRef;
@@ -16,7 +17,11 @@ pub mod logging;
 use lib_loader::{LibLoader, TestTrait};
 use logging::init_logging;
 
-use std::thread;
+use std::{
+    cell::RefCell,
+    sync::{Arc, Mutex},
+    thread,
+};
 
 use keyboard_types::KeyboardEvent;
 
@@ -37,23 +42,6 @@ baseplug::model! {
         #[parameter(name = "gain master", unit = "Decibels",
             gradient = "Power(0.15)")]
         pub gain_master: f32,
-
-
-        #[model(min = 0.0, max = 1.0)]
-        #[parameter(name = "path_val1", unit = "Generic",
-            gradient = "Linear")]
-        pub path_val1: f32,
-
-        #[model(min = 0.0, max = 1.0)]
-        #[parameter(name = "path_val2", unit = "Generic",
-            gradient = "Linear")]
-        pub path_val2: f32,
-
-
-        #[model(min = 0.0, max = 1.0)]
-        #[parameter(name = "path_val2", unit = "Generic",
-            gradient = "Linear")]
-        pub update_event: f32,
     }
 }
 
@@ -66,26 +54,36 @@ impl Default for GainModel {
             gain_left: 1.0,
             gain_right: 1.0,
             gain_master: 1.0,
-            path_val1: 0.0,
-            path_val2: 0.0,
-            update_event: 0.0,
         }
     }
 }
 
-pub struct GainShared {}
+pub struct GainShared {
+    lib_load: Arc<Mutex<LibLoader>>,
+    process_trait_prod: Arc<Mutex<Producer<Box<dyn TestTrait>>>>,
+    process_trait_cons: RefCell<Consumer<Box<dyn TestTrait>>>,
+}
 
 unsafe impl Send for GainShared {}
 unsafe impl Sync for GainShared {}
 
 impl PluginContext<Gain> for GainShared {
     fn new() -> Self {
-        Self {}
+        init_logging("EGUIBaseviewTest.log");
+        let mut lib_load = LibLoader::new();
+        lib_load.load();
+
+        let rb = RingBuffer::<Box<dyn TestTrait>>::new(2);
+        let (prod, cons) = rb.split();
+        Self {
+            lib_load: Arc::new(Mutex::new(lib_load)),
+            process_trait_prod: Arc::new(Mutex::new(prod)),
+            process_trait_cons: RefCell::new(cons),
+        }
     }
 }
 
 struct Gain {
-    lib_load: Option<LibLoader>,
     process_trait: Option<Box<dyn TestTrait>>,
 }
 
@@ -102,10 +100,7 @@ impl Plugin for Gain {
 
     #[inline]
     fn new(_sample_rate: f32, _model: &GainModel, _shared: &GainShared) -> Self {
-        init_logging("EGUIBaseviewTest.log");
-
         Self {
-            lib_load: None,
             process_trait: None,
         }
     }
@@ -115,34 +110,11 @@ impl Plugin for Gain {
         &mut self,
         model: &GainModelProcess,
         ctx: &mut ProcessContext<Self>,
-        _shared: &GainShared,
+        shared: &GainShared,
     ) {
-        let current_vals = (
-            model.path_val1[ctx.nframes - 1],
-            model.path_val2[ctx.nframes - 1],
-        );
-
-        if self.lib_load.is_none() {
-            self.lib_load = LibLoader::new_from_vals(current_vals);
-            if let Some(lib_load) = self.lib_load.as_mut() {
-                lib_load.load_existing();
-                self.process_trait = lib_load.get_process_trait();
-            }
-        }
-
-        if let Some(lib_load) = self.lib_load.as_mut() {
-            if lib_load.rnd_path_vals != current_vals
-                || lib_load.update_event != model.update_event[ctx.nframes - 1]
-            {
-                lib_load.update_event = model.update_event[ctx.nframes - 1];
-                self.lib_load = LibLoader::new_from_vals(current_vals);
-                if let Some(lib_load) = self.lib_load.as_mut() {
-                    lib_load.load_existing();
-                    self.process_trait = lib_load.get_process_trait();
-                }
-
-                ::log::info!("process RELOAD thread id {:?}", thread::current().id());
-            }
+        let mut process_trait_cons = shared.process_trait_cons.borrow_mut();
+        if !process_trait_cons.is_empty() {
+            self.process_trait = Some(process_trait_cons.pop().unwrap());
         }
 
         let input = &ctx.inputs[0].buffers;
@@ -204,7 +176,7 @@ impl baseplug::PluginUI for Gain {
 
     fn ui_open(
         parent: &impl HasRawWindowHandle,
-        _ctx: &GainShared,
+        shared_ctx: &GainShared,
         model: <Self::Model as Model<Self>>::UI,
     ) -> WindowOpenResult<Self::Handle> {
         let settings = Settings {
@@ -221,7 +193,8 @@ impl baseplug::PluginUI for Gain {
             settings,
             EditorState {
                 state: State::new(model),
-                lib_load: LibLoader::new(),
+                lib_load: shared_ctx.lib_load.clone(),
+                process_trait_prod: shared_ctx.process_trait_prod.clone(),
             },
             // Called once before the first frame. Allows you to do setup code and to
             // call `ctx.set_fonts()`. Optional.
@@ -232,33 +205,21 @@ impl baseplug::PluginUI for Gain {
                 // Must be called on the top of each frame in order to sync values from the rt thread.
 
                 egui::Window::new("egui-baseplug gain demo").show(&egui_ctx, |ui| {
+                    let mut lib_load = editor_state.lib_load.lock().unwrap();
+                    let mut process_trait_prod = editor_state.process_trait_prod.lock().unwrap();
                     if ui.button("RELOAD").clicked() {
-                        editor_state.lib_load.load();
-                        let v = editor_state.state.model.update_event.value();
-                        editor_state
-                            .state
-                            .model
-                            .update_event
-                            .set_from_normalized(v + 0.0001);
+                        lib_load.load();
+                        if !process_trait_prod.is_full() {
+                            match process_trait_prod.push(lib_load.get_process_trait().unwrap()) {
+                                Ok(_) => ::log::info!("push worked"),
+                                Err(_) => ::log::info!("push didn't work"),
+                            }
+                        }
+
                         ::log::info!("UI RELOAD thread id {:?}", thread::current().id());
                     }
-                    editor_state
-                        .state
-                        .model
-                        .path_val1
-                        .set_from_normalized(editor_state.lib_load.rnd_path_vals.0);
-                    editor_state
-                        .state
-                        .model
-                        .path_val2
-                        .set_from_normalized(editor_state.lib_load.rnd_path_vals.1);
 
                     let state = &mut editor_state.state;
-
-                    ui.label(&editor_state.lib_load.rnd_path_str);
-
-                    ui.label(editor_state.lib_load.rnd_path_vals.0.to_string());
-                    ui.label(editor_state.lib_load.rnd_path_vals.1.to_string());
 
                     // Sync text values if there was automation.
                     update_value_text(&mut state.gain_master_value, &state.model.gain_master);
@@ -272,7 +233,7 @@ impl baseplug::PluginUI for Gain {
                         &mut state.model.gain_master,
                     );
 
-                    editor_state.lib_load.ui_func(state, ui);
+                    lib_load.ui_func(state, ui);
                 });
 
                 // TODO: Add a way for egui-baseview to send a closure that runs every frame without always
@@ -289,12 +250,10 @@ impl baseplug::PluginUI for Gain {
     }
 
     fn ui_key_down(_ctx: &GainShared, _ev: KeyboardEvent) -> bool {
-        // TODO
         true
     }
 
     fn ui_key_up(_ctx: &GainShared, _ev: KeyboardEvent) -> bool {
-        // TODO
         true
     }
 
@@ -308,7 +267,8 @@ impl baseplug::PluginUI for Gain {
 
 pub struct EditorState {
     state: State,
-    lib_load: LibLoader,
+    lib_load: Arc<Mutex<LibLoader>>,
+    process_trait_prod: Arc<Mutex<Producer<Box<dyn TestTrait>>>>,
 }
 
 pub struct State {
