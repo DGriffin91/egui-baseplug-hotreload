@@ -158,7 +158,7 @@ pub fn param_slider(
 }
 
 pub fn format_value(value_text: &mut String, param: &UIFloatParam) {
-    *value_text = format!("{:.1} {}", param.value(), param.unit_label());
+    *value_text = format!("{:.1} {}", param.unit_value(), param.unit_label());
 }
 
 pub fn update_value_text(value_text: &mut String, param: &UIFloatParam) {
